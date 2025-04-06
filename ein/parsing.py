@@ -47,10 +47,10 @@ class ParsedExpression:
 
         Args:
             expression: String expression to tokenize
-            
+
         Returns:
             List of tokens
-        
+
         Raises:
             ValidationError: If invalid token patterns are found
         """
@@ -142,7 +142,11 @@ class ParsedExpression:
             elif token == "…":
                 current_group.append(EllipsisNode())
             elif token.isdigit():
-                current_group.append(AnonymousAxis(token))
+                # Special handling for '1' as a literal rather than anonymous axis
+                if token == '1' and is_input_pattern:
+                    current_group.append(AxisNode(token))  # Treat as named axis
+                else:
+                    current_group.append(AnonymousAxis(token))
             else:
                 current_group.append(AxisNode(token))
 
@@ -182,6 +186,10 @@ class ParsedExpression:
             if not isinstance(ident, str):
                 return False
 
+            # Special case: Allow '1' as valid identifier for singleton dimensions
+            if ident == '1':
+                return True
+                
             # Check for empty string
             if not ident:
                 return False

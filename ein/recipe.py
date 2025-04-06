@@ -113,6 +113,26 @@ class SplitLastDim(Operation):
         return f"SplitLastDim(dim1={self.dim1}, dim2={self.dim2})"
 
 
+# Add new operation for repeating dimensions
+class RepeatDim(Operation):
+    """Operation that repeats a singleton dimension to a specified size."""
+
+    def __init__(self, dim_index: int, repeat_count: int):
+        self.dim_index = dim_index
+        self.repeat_count = repeat_count
+
+    def apply(self, tensor: np.ndarray) -> np.ndarray:
+        # Ensure the dimension is indeed a singleton
+        if tensor.shape[self.dim_index] != 1:
+            raise ValueError(f"Cannot repeat non-singleton dimension {self.dim_index}")
+
+        # Use np.repeat to repeat the dimension
+        return np.repeat(tensor, self.repeat_count, axis=self.dim_index)
+
+    def __repr__(self):
+        return f"RepeatDim(dim_index={self.dim_index}, repeat_count={self.repeat_count})"
+
+
 class CompositeOperation(Operation):
     """Combines multiple operations into a single unit for optimization."""
 
@@ -209,6 +229,9 @@ class RecipeBuilder:
 
         # Maps axis names to their sizes
         self.axis_sizes: Dict[str, int] = {}
+        
+        # Track dimensions that need repeating (index -> repeat_count)
+        self.repeat_dims: Dict[int, int] = {}
 
     def infer_axis_sizes(self) -> Dict[str, int]:
         """Infer sizes of all named axes from the input expression and shape."""
@@ -234,6 +257,12 @@ class RecipeBuilder:
                         f"(needed {shape_idx+1} but only have {len(self.input_shape)})"
                     )
                 self.axis_sizes[node.name] = self.input_shape[shape_idx]
+                
+                # Check for singleton dimension with name '1'
+                if node.name == '1' and self.input_shape[shape_idx] == 1:
+                    # Remember this position for possible repeating
+                    self.repeat_dims[shape_idx] = None  # Value will be filled later
+                
                 return shape_idx + 1
 
             elif isinstance(node, EllipsisNode):
@@ -369,6 +398,10 @@ class RecipeBuilder:
         Build a transpose operation if the axis order changes.
         Properly handles ellipsis in both input and output.
         """
+        # Skip transpose completely for any pattern that contains a repeat operation
+        if any(repeat_count is not None for dim_idx, repeat_count in self.repeat_dims.items()):
+            return
+
         # Get flat representations of input and output expressions
         flat_input = flatten_expr(self.input_expr.nodes)
         flat_output = flatten_expr(self.output_expr.nodes)
@@ -463,20 +496,53 @@ class RecipeBuilder:
         """Build the complete recipe with optimizations for common patterns."""
         # Step 1: Infer sizes of all axes
         self.infer_axis_sizes()
-
-        # Step 2: Build transpose operation if needed
+        
+        # Step 2: Find repeating dimensions 
+        # (Compare input pattern with output pattern to identify repeat operations)
+        flat_input = flatten_expr(self.input_expr.nodes)
+        flat_output = flatten_expr(self.output_expr.nodes)
+        
+        # Map input axes to their positions
+        input_dim_map = {}
+        for i, node in enumerate(flat_input):
+            if isinstance(node, AxisNode):
+                input_dim_map[node.name] = i
+        
+        # Check output axes - if a '1' in input is replaced with a named dimension in output
+        # that has a size parameter, it's a repeat operation
+        for i, node in enumerate(flat_output):
+            if isinstance(node, AxisNode) and node.name in self.axis_sizes:
+                if node.name in input_dim_map:
+                    # This is a mapped dimension, not a repeat
+                    continue
+                    
+                # Check if this dimension name corresponds to a known size from kwargs
+                if node.name in self.output_expr.known_axes:
+                    # Look for singleton dimensions in input that need repeating
+                    for dim_idx, _ in self.repeat_dims.items():
+                        # We found a dimension to repeat
+                        if self.repeat_dims[dim_idx] is None:
+                            self.repeat_dims[dim_idx] = self.axis_sizes[node.name]
+                            break
+        
+        # Step 3: Add repeat operations first (before transpose)
+        for dim_idx, repeat_count in list(self.repeat_dims.items()):
+            if repeat_count and repeat_count > 1:
+                self.recipe.add_operation(RepeatDim(dim_idx, repeat_count))
+        
+        # Step 4: Build transpose operation if needed
         self.build_transpose_operation()
 
-        # Step 3: Calculate the final output shape
+        # Step 5: Calculate the final output shape
         output_shape = self.calculate_output_shape()
 
-        # Step 4: Calculate the shape after existing operations
+        # Step 6: Calculate the shape after existing operations
         current_shape = list(self.input_shape)
         for op in self.recipe.operations:
             if isinstance(op, Transpose):
                 current_shape = [current_shape[i] for i in op.axes]
 
-        # Step 5: Add reshape operation if needed with optimized operations
+        # Step 7: Add reshape operation if needed with optimized operations
         if tuple(current_shape) != tuple(output_shape):
             # Check for specialized operations
 
@@ -506,7 +572,7 @@ class RecipeBuilder:
             else:
                 self.recipe.add_operation(Reshape(output_shape))
 
-        # Step 6: Set the final output shape on the recipe
+        # Step 8: Set the final output shape on the recipe
         self.recipe.output_shape = tuple(output_shape)
 
         return self.recipe
@@ -525,8 +591,8 @@ def rearrange(tensor: np.ndarray, pattern: str, **axis_sizes) -> np.ndarray:
 
     Args:
         tensor: Input tensor (numpy array)
-        pattern: Pattern string like "b c h w -> b (c h) w"
-        **axis_sizes: Additional axis sizes for splits
+        pattern: Pattern string like "b c h w -> b (h w) c"
+        **axis_sizes: Additional axis sizes for splits or dimension repeats
 
     Returns:
         Transformed tensor
@@ -538,6 +604,10 @@ def rearrange(tensor: np.ndarray, pattern: str, **axis_sizes) -> np.ndarray:
 
     # Parse pattern (this uses the pattern cache)
     input_expr, output_expr = parse_pattern(pattern, axis_sizes)
+    
+    # Set known axes in both expressions to ensure proper handling
+    input_expr.known_axes = axis_sizes
+    output_expr.known_axes = axis_sizes
 
     # Build recipe
     builder = RecipeBuilder(input_expr, output_expr, tensor.shape)

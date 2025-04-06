@@ -71,3 +71,21 @@ def test_recipe_builder():
     assert isinstance(recipe, Recipe)
     assert recipe.input_shape == shape
     assert recipe.output_shape == (4, 2, 3)
+
+
+def test_repeating_axes():
+    """Test repeating singleton dimensions."""
+    # Single repeating axis
+    tensor = np.random.rand(3, 1, 5)
+    result = rearrange(tensor, 'a 1 c -> a b c', b=4)
+    assert result.shape == (3, 4, 5)
+    for i in range(4):
+        np.testing.assert_array_equal(result[:, i, :], tensor[:, 0, :])
+
+    # Multiple repeating axes
+    tensor = np.random.rand(2, 1, 3, 1)
+    result = rearrange(tensor, 'a 1 c 1 -> a b c d', b=2, d=3)
+    assert result.shape == (2, 2, 3, 3)
+    for i in range(2):
+        for j in range(3):
+            np.testing.assert_array_equal(result[:, i, :, j], tensor[:, 0, :, 0])
