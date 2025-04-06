@@ -9,16 +9,18 @@ from ein.utils import get_named_axes, get_duplicate_axes, has_anonymous_axis
 class ParsedExpression:
     """Parses an einops-style pattern into an expression tree."""
 
-    def __init__(self, expression: str):
+    def __init__(self, expression: str, is_input_pattern=True, known_axes=None):
         self.expression = expression
-        self.nodes = self._parse(expression)
+        self.is_input_pattern = is_input_pattern
+        self.known_axes = known_axes or {}
+        self.nodes = self._parse(expression, is_input_pattern, known_axes)
         self._validate_tree()
 
     def _parse(
-        self, expression: str
+        self, expression: str, is_input_pattern=True, known_axes=None
     ) -> List[Union[AxisNode, MergeNode, SplitNode, EllipsisNode]]:
         tokens = self._tokenize(expression)
-        return self._build_tree(tokens)
+        return self._build_tree(tokens, is_input_pattern, known_axes)
 
     def _tokenize(self, expression: str) -> List[str]:
         """Splits the input string into meaningful tokens."""
@@ -43,9 +45,18 @@ class ParsedExpression:
         return expression_list
 
     def _build_tree(
-        self, tokens: List[str]
+        self, tokens: List[str], is_input_pattern=True, known_axes=None
     ) -> List[Union[AxisNode, MergeNode, SplitNode, EllipsisNode, AnonymousAxis]]:
-        """Converts tokens into an expression tree."""
+        """Converts tokens into an expression tree.
+        
+        Args:
+            tokens: List of tokens to parse
+            is_input_pattern: Whether this is an input pattern (affects split/merge detection)
+            known_axes: Dictionary of axis names that are explicitly specified in kwargs
+        """
+        if known_axes is None:
+            known_axes = {}
+
         stack = []
         current_group = []
 
@@ -57,23 +68,37 @@ class ParsedExpression:
                 if not stack:
                     raise ValidationError("Unmatched closing parenthesis in pattern.")
                 last_group = stack.pop()
-                if len(current_group) == 1:
-                    last_group.append(current_group[0])  # Single axis, no merge/split
-                elif any(
-                    isinstance(x, AnonymousAxis) or (isinstance(x, int))
-                    for x in current_group
-                ):
-                    last_group.append(SplitNode(current_group))
+                
+                # Special handling for input pattern with known explicit axes
+                if is_input_pattern and len(current_group) > 1:
+                    # Check if any axes in the group are in known_axes
+                    axis_names = [node.name for node in current_group
+                                 if isinstance(node, AxisNode)]
+                    is_split = any(name in known_axes for name in axis_names)
+                    
+                    if is_split:
+                        # We found axes that match our explicit kwargs, treat as SplitNode
+                        last_group.append(SplitNode(current_group))
+                    elif any(isinstance(x, AnonymousAxis) for x in current_group):
+                        # Traditional detection via anonymous axes
+                        last_group.append(SplitNode(current_group))
+                    else:
+                        # Default to MergeNode
+                        last_group.append(MergeNode(current_group))
                 else:
-                    last_group.append(MergeNode(current_group))
+                    # Existing logic for simple cases and output patterns
+                    if len(current_group) == 1:
+                        last_group.append(current_group[0])  # Single axis, no merge/split
+                    elif any(isinstance(x, AnonymousAxis) for x in current_group):
+                        last_group.append(SplitNode(current_group))
+                    else:
+                        last_group.append(MergeNode(current_group))
+                        
                 current_group = last_group
             elif token == "…":
                 current_group.append(EllipsisNode())
             elif token.isdigit():
-                raise ValidationError(
-                    f"Numeric literals like '{token}' are not allowed directly in the pattern. "
-                    "Use a named axis and pass it as a keyword argument (e.g. 'h1=2')."
-                )
+                current_group.append(AnonymousAxis(token))
             else:
                 current_group.append(AxisNode(token))
 
@@ -90,6 +115,10 @@ class ParsedExpression:
 
         seen_axes = set()
         ellipsis_count = 0
+
+        # Store a reference to known_axes that was passed during initialization
+        known_axes = getattr(self, 'known_axes', {})
+        is_input_pattern = getattr(self, 'is_input_pattern', True)
 
         def is_valid_identifier(ident):
             """Determines if string is valid Python identifier and not a keyword."""
@@ -145,14 +174,32 @@ class ParsedExpression:
                     validate_node(subnode)
 
             elif isinstance(node, SplitNode):
-                # Splitting should have at least one AnonymousAxis
-                has_anonymous = any(
-                    isinstance(subnode, AnonymousAxis) for subnode in node.axes
-                )
-                if not has_anonymous:
-                    raise ValidationError(
-                        f"Splitting requires at least one numeric size: {node}"
+                # For input patterns, we allow SplitNodes without AnonymousAxis if the axes 
+                # are listed in known_axes
+                if is_input_pattern:
+                    # Check if any axes in the SplitNode are in known_axes
+                    axis_names = [subnode.name for subnode in node.axes 
+                                 if isinstance(subnode, AxisNode)]
+                    has_known_axes = any(name in known_axes for name in axis_names)
+                    
+                    # Only enforce the AnonymousAxis requirement if we don't have known axes
+                    if not has_known_axes:
+                        has_anonymous = any(
+                            isinstance(subnode, AnonymousAxis) for subnode in node.axes
+                        )
+                        if not has_anonymous:
+                            raise ValidationError(
+                                f"Splitting requires at least one numeric size or explicit size parameter: {node}"
+                            )
+                else:
+                    # For output patterns, we still require at least one AnonymousAxis
+                    has_anonymous = any(
+                        isinstance(subnode, AnonymousAxis) for subnode in node.axes
                     )
+                    if not has_anonymous:
+                        raise ValidationError(
+                            f"Splitting requires at least one numeric size: {node}"
+                        )
 
                 for subnode in node.axes:
                     if isinstance(subnode, EllipsisNode):
@@ -185,7 +232,7 @@ def validate_pair(input_expr, output_expr):
 
     # Rule 1: Named output axes must exist in input
     for axis in output_axes:
-        if axis not in input_axes:
+        if axis not in input_axes and axis not in getattr(input_expr, 'known_axes', {}):
             raise ValidationError(f"Output axis '{axis}' not found in input.")
 
     # Rule 2: No duplicates
@@ -196,21 +243,17 @@ def validate_pair(input_expr, output_expr):
     if output_dups:
         raise ValidationError(f"Duplicate axes in output: {output_dups}")
 
-    # Rule 3: No anonymous axes in input
-    if has_anonymous_axis(input_expr.nodes):
-        raise ValidationError("Anonymous axes (like `2`) are not allowed in input pattern.")
+    # Rule 3: Anonymous axes not allowed in output without named binding
+    # Get the known_axes from the input expression
+    known_axes = getattr(input_expr, 'known_axes', {})
+    
+    # Check if any anonymous axes exist in the output
+    has_anonymous = has_anonymous_axis(output_expr.nodes)
+    
+    # If we have anonymous axes in output, ensure we have corresponding known_axes
+    if has_anonymous and not known_axes:
+        raise ValidationError("Anonymous axis in output pattern must be named using kwargs.")
 
-    # Rule 4: Anonymous axes in output must be of length 1
-    def check_output_anonymous(nodes):
-        for node in nodes:
-            if isinstance(node, AnonymousAxis) and node.value != 1:
-                raise ValidationError(
-                    "Non-unitary anonymous axes are not supported in rearrange (only `1` is allowed)."
-                )
-            elif isinstance(node, (MergeNode, SplitNode)):
-                check_output_anonymous(node.axes)
-
-    check_output_anonymous(output_expr.nodes)
 
 def flatten_expr(nodes):
     """
@@ -229,11 +272,43 @@ def flatten_expr(nodes):
 
     return result
 
-def infer_axis_sizes(flat_input_seq, input_shape):
+def flatten_expr_for_dim_count(nodes):
+    """
+    Flattens an expression tree to determine how many actual dimensions it represents.
+    This is different from regular flatten_expr as it treats SplitNode as a single dimension.
+    """
+    result = []
+
+    for node in nodes:
+        if isinstance(node, (AxisNode, AnonymousAxis, EllipsisNode)):
+            result.append(node)
+        elif isinstance(node, MergeNode):
+            result.extend(flatten_expr_for_dim_count(node.axes))
+        elif isinstance(node, SplitNode):
+            # For dimension counting purposes, a SplitNode is a single dimension
+            # Find the first AxisNode to represent it
+            for subnode in node.axes:
+                if isinstance(subnode, AxisNode):
+                    result.append(subnode)
+                    break
+            else:
+                # If no AxisNode, append something to represent the dimension
+                result.append(AnonymousAxis("2"))  # Default placeholder
+        else:
+            raise TypeError(f"Unsupported node type: {type(node)}")
+    
+    return result
+
+def infer_axis_sizes(flat_input_seq, input_shape, axis_sizes=None):
     """
     Given the flattened input expression and actual tensor shape, return a dictionary
     mapping axis names to dimensions.
     """
+    if axis_sizes is None:
+        axis_sizes = {}
+    else:
+        axis_sizes = axis_sizes.copy()  # Don't modify the input
+    
     shape_dict = {}
     input_index = 0
 
@@ -252,9 +327,14 @@ def infer_axis_sizes(flat_input_seq, input_shape):
                 shape_dict[f"...{i}"] = input_shape[input_index]
                 input_index += 1
         elif isinstance(node, AnonymousAxis):
-            input_index += 1  # Skip anonymous axis in shape binding
+            if input_index >= len(input_shape):
+                raise ValidationError("Not enough dimensions in input shape to bind anonymous axis.")
+            input_index += 1  # Consume one dimension for the anonymous axis
 
     if input_index != len(input_shape):
         raise ValidationError("Input shape does not match number of axes in pattern.")
+
+    # Add any explicitly provided sizes
+    shape_dict.update(axis_sizes)
 
     return shape_dict

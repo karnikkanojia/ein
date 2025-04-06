@@ -85,9 +85,6 @@ def test_parse_expression():
     parsed = ParsedExpression("a b c d")
     assert parsed.nodes == [AxisNode("a"), AxisNode("b"), AxisNode("c"), AxisNode("d")]
 
-    with pytest.raises(ValidationError):
-        ParsedExpression("a (b 2)")
-
     parsed = ParsedExpression("a ... b")
     assert parsed.nodes == [AxisNode("a"), EllipsisNode(), AxisNode("b")]
 
@@ -100,21 +97,24 @@ def test_parse_expression():
 
 
 @pytest.mark.parametrize(
-    "input_expr, output_expr",
+    "input_expr, output_expr, known_axes",
     [
-        ("b h w c", "b c h w"),
-        ("b h w", "b (h w)"),
-        ("b ... c", "b c ..."),
-        ("b (h 2) (w 3)", "b h w 2 3"),
-        ("(b h) w", "b h w"),
-        ("... h w", "h ... w"),
-        ("b (h 2) w", "b h 2 w"),
-        ("(b h) w", "b 2 h w"),
+        ("b h w c", "b c h w", {}),
+        ("b h w", "b (h w)", {}),
+        ("b ... c", "b c ...", {}),
+        ("b (h h1) (w w1)", "b h w h1 w1", {"h1": 2, "w1": 3}),
+        ("(b h) w", "b h w", {}),
+        ("... h w", "h ... w", {}),
+        ("b (h h1) w", "b h h1 w", {"h1": 2}),
+        ("(b h) w", "b h w", {"b": 2, "h": 2}),
+        # Add split node test cases with known_axes
+        ("a (b c)", "a b c", {"b": 3, "c": 4}),
+        ("batch (height width)", "batch height width", {"height": 224, "width": 224}),
     ],
 )
-def test_valid_pairs(input_expr, output_expr):
-    input_tree = ParsedExpression(input_expr)
-    output_tree = ParsedExpression(output_expr)
+def test_valid_pairs(input_expr, output_expr, known_axes):
+    input_tree = ParsedExpression(input_expr, is_input_pattern=True, known_axes=known_axes)
+    output_tree = ParsedExpression(output_expr, is_input_pattern=False)
     validate_pair(input_tree, output_tree)  # should not raise
 
 

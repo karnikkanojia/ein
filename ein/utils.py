@@ -1,18 +1,20 @@
 from ein.nodes import AxisNode, MergeNode, SplitNode, EllipsisNode, AnonymousAxis
 
 def get_named_axes(nodes):
-    axes = set()
-
-    def _walk(node):
+    """Get all named axes from an expression tree."""
+    result = set()
+    
+    def extract_names(node):
         if isinstance(node, AxisNode):
-            axes.add(node.name)
+            result.add(node.name)
         elif isinstance(node, (MergeNode, SplitNode)):
-            for sub in node.axes:
-                _walk(sub)
-
+            for subnode in node.axes:
+                extract_names(subnode)
+    
     for node in nodes:
-        _walk(node)
-    return axes
+        extract_names(node)
+    
+    return result
 
 
 def has_anonymous_axis(nodes):
