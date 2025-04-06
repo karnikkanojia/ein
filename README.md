@@ -252,3 +252,69 @@ Memory increase: 0.00 MB
 ================================================================================
 
 ```
+
+## Implementation Details
+
+### Approach
+
+The `ein` library is a clean-room implementation of the tensor rearrangement functionality provided by the popular `einops` library. Our key design principles were:
+
+1. **Parser-First Architecture**: We built a robust parser for Einstein-notation expressions that constructs an expression tree, allowing for flexible tensor manipulations.
+
+2. **Recipe-Based Execution**: Operations are compiled into "recipes" that can be cached and reused, avoiding repeated parsing overhead.
+
+3. **Minimal Dependencies**: The core implementation relies only on NumPy, with optional Numba acceleration.
+
+### Design Decisions
+
+#### Expression Parsing
+
+Expressions like `"b c h w -> b (h w) c"` are parsed into a tree of nodes representing different tensor operations:
+- `AxisNode`: Named dimensions (e.g., 'b', 'c')
+- `MergeNode`: Combined dimensions (e.g., '(h w)')
+- `SplitNode`: Dimensions split into parts
+- `EllipsisNode`: Variable dimensions (`...`)
+
+This tree-based representation allows for easy validation and transformation of tensor operations.
+
+#### Caching System
+
+We implemented an aggressive caching system that stores:
+1. Parsed expressions to avoid repeated parsing
+2. Compiled recipes to avoid recomputing reshape and transpose parameters
+3. Common transformation patterns for quick lookup
+
+This results in a significant speedup for repeated operations (25x faster for cached vs. first-time calls).
+
+#### Optimization Strategies
+
+Our implementation uses several optimization strategies:
+- Minimizing intermediate tensor allocations
+- Using direct NumPy operations where possible
+- Optimizing memory layout with contiguous arrays
+
+#### Numba Integration
+
+We experimented with Numba JIT compilation for core operations, but found that for tensor reshape and transpose operations, the overhead of Numba compilation often outweighs the benefits for small tensors. In particular:
+- Simple operations are ~25% faster without Numba
+- Complex rearrangements show dramatic differences (857K ops/sec without Numba vs 35K ops/sec with Numba)
+
+### Comparison with `einops`
+
+#### Similarities
+- API compatible with `einops.rearrange`
+- Support for the same expression syntax
+- Handling of named dimensions, merging, splitting, and ellipsis
+
+#### Differences
+- Different internal representation of tensor operations
+- Our implementation performs better without Numba JIT compilation
+- More aggressive caching strategy
+
+#### Performance
+
+As shown in the benchmark results, our implementation:
+- Outperforms einops on most operations when using standard NumPy (0.76x-0.98x ratio)
+- Is particularly efficient for splitting axes (25% faster than einops)
+- Shows consistent performance across different tensor shapes and operations
+- Has excellent cache utilization (25x speedup for cached operations)
