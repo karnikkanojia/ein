@@ -1,5 +1,8 @@
 # ein
-Implementation for rearrange function from einops library. You can view the notebook in this link: [Colab Notebook]([https://link-url-here.org](https://colab.research.google.com/drive/1hEsWYEew_zPVUoExKnMI-J_9TiYsag2I?usp=sharing))
+Implementation for rearrange function from einops library. You can view the notebook in this link:  
+
+[Colab Notebook](https://colab.research.google.com/drive/1hEsWYEew_zPVUoExKnMI-J_9TiYsag2I#scrollTo=hicVVa2Y_hTW)
+
 
 ## Benchmarks
 
