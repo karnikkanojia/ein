@@ -113,29 +113,34 @@ def test_parse_expression():
     ],
 )
 def test_valid_pairs(input_expr, output_expr, known_axes):
-    input_tree = ParsedExpression(input_expr, is_input_pattern=True, known_axes=known_axes)
+    input_tree = ParsedExpression(
+        input_expr, is_input_pattern=True, known_axes=known_axes
+    )
     output_tree = ParsedExpression(output_expr, is_input_pattern=False)
     validate_pair(input_tree, output_tree)  # should not raise
 
 
-@pytest.mark.parametrize("input_expr, output_expr", [
-    ("b h h", "b h"),
-    ("b 2 h", "b h 2"),
-    ("(b 2) h", "b 2 h"),
-    ("(... b) h", "b h"),
-    ("b 1x h", "b h"),
-    ("b ... h ...", "b h"),
-    ("b h", "b h x"),
-    ("b ... h", "b h x"),
-    ("b h", "b c d"),
-    ("b h", "b 1 h"),
-    ("b h", "b two h"),
-    ("", "b h"),
-    ("(b h", "b h"),
-    ("b h)", "b h"),
-    ("b (h 2)", "b h 2"),
-    ("b h", "b 2 h"),
-])
+@pytest.mark.parametrize(
+    "input_expr, output_expr",
+    [
+        ("b h h", "b h"),
+        ("b 2 h", "b h 2"),
+        ("(b 2) h", "b 2 h"),
+        ("(... b) h", "b h"),
+        ("b 1x h", "b h"),
+        ("b ... h ...", "b h"),
+        ("b h", "b h x"),
+        ("b ... h", "b h x"),
+        ("b h", "b c d"),
+        ("b h", "b 1 h"),
+        ("b h", "b two h"),
+        ("", "b h"),
+        ("(b h", "b h"),
+        ("b h)", "b h"),
+        ("b (h 2)", "b h 2"),
+        ("b h", "b 2 h"),
+    ],
+)
 def test_invalid_pairs(input_expr, output_expr):
     with pytest.raises(ValidationError):
         input_tree = ParsedExpression(input_expr)
@@ -170,7 +175,12 @@ def test_flatten_expr_with_split():
         SplitNode([AxisNode("b"), AnonymousAxis("2")]),
         AxisNode("d"),
     ]
-    expected = [AxisNode("a"), AxisNode("b"), AnonymousAxisPlaceholder(2), AxisNode("d")]
+    expected = [
+        AxisNode("a"),
+        AxisNode("b"),
+        AnonymousAxisPlaceholder(2),
+        AxisNode("d"),
+    ]
     assert flatten_expr(nodes) == expected
 
 
@@ -182,12 +192,12 @@ def test_flatten_expr_nested():
         SplitNode([AxisNode("d"), SplitNode([AxisNode("e"), AnonymousAxis("2")])]),
     ]
     expected = [
-        AxisNode("a"), 
-        AxisNode("b"), 
-        AxisNode("c"), 
-        AxisNode("d"), 
-        AxisNode("e"), 
-        AnonymousAxisPlaceholder(2)
+        AxisNode("a"),
+        AxisNode("b"),
+        AxisNode("c"),
+        AxisNode("d"),
+        AxisNode("e"),
+        AnonymousAxisPlaceholder(2),
     ]
     assert flatten_expr(nodes) == expected
 
@@ -279,11 +289,11 @@ def test_infer_axis_sizes_too_many_dims():
 def test_infer_axis_sizes_complex():
     """Test inferring axis sizes for complex expressions."""
     flat_seq = [
-        AxisNode("batch"), 
-        AxisNode("height"), 
-        AxisNode("width"), 
-        EllipsisNode(), 
-        AxisNode("channels")
+        AxisNode("batch"),
+        AxisNode("height"),
+        AxisNode("width"),
+        EllipsisNode(),
+        AxisNode("channels"),
     ]
     input_shape = [32, 224, 224, 3, 3, 3]
     expected = {
@@ -292,6 +302,6 @@ def test_infer_axis_sizes_complex():
         "width": 224,
         "...0": 3,
         "...1": 3,
-        "channels": 3
+        "channels": 3,
     }
     assert infer_axis_sizes(flat_seq, input_shape) == expected

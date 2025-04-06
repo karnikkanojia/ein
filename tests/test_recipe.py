@@ -33,7 +33,7 @@ def test_complex_rearrangement():
     """Test a more complex rearrangement with multiple operations."""
     tensor = np.arange(30).reshape(2, 3, 5)
     result = rearrange(tensor, "a b c -> c (a b)")
-    expected = tensor.transpose(2, 0, 1).reshape(5, 6)
+    expected = np.transpose(tensor, (2, 0, 1)).reshape(5, 6)
     np.testing.assert_array_equal(result, expected)
 
 
