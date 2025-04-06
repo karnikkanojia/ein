@@ -9,14 +9,34 @@ from ein.nodes import (
 )
 from typing import List, Tuple, Dict, Union
 import numpy as np
+from functools import lru_cache
+
+# Add after imports
+_PATTERN_CACHE = {}
+_RECIPE_CACHE = {}
+
+def parse_pattern(pattern: str, known_axes=None):
+    """Parse a pattern string with caching."""
+    # Use a cache key that includes the pattern and known_axes
+    cache_key = (pattern, tuple(sorted(known_axes.items())) if known_axes else None)
+    
+    if cache_key not in _PATTERN_CACHE:
+        if "->" not in pattern:
+            raise ValueError("Pattern must contain '->' to separate input and output expressions")
+            
+        input_pattern, output_pattern = pattern.split("->")
+        _PATTERN_CACHE[cache_key] = (
+            ParsedExpression(input_pattern.strip(), is_input_pattern=True, known_axes=known_axes),
+            ParsedExpression(output_pattern.strip(), is_input_pattern=False)
+        )
+    
+    return _PATTERN_CACHE[cache_key]
 
 
 class Operation:
     """Base class for transformation operations."""
-    def __init__(self):
-        pass
-
     def apply(self, tensor: np.ndarray) -> np.ndarray:
+        """Apply this operation to a tensor."""
         raise NotImplementedError("Subclasses must implement apply")
 
     def __repr__(self):
@@ -26,7 +46,7 @@ class Operation:
 class Reshape(Operation):
     """Reshape operation that changes tensor dimensions."""
     def __init__(self, shape: List[int]):
-        self.shape = shape
+        self.shape = tuple(shape)  # Convert to tuple for immutability
 
     def apply(self, tensor: np.ndarray) -> np.ndarray:
         return np.reshape(tensor, self.shape)
@@ -38,13 +58,28 @@ class Reshape(Operation):
 class Transpose(Operation):
     """Transpose operation that permutes tensor dimensions."""
     def __init__(self, axes: List[int]):
-        self.axes = axes
+        self.axes = tuple(axes)  # Convert to tuple for immutability
 
     def apply(self, tensor: np.ndarray) -> np.ndarray:
         return np.transpose(tensor, self.axes)
 
     def __repr__(self):
         return f"Transpose(axes={self.axes})"
+
+
+class CompositeOperation(Operation):
+    """Combines multiple operations into a single unit for optimization."""
+    def __init__(self, operations: List[Operation]):
+        self.operations = operations
+
+    def apply(self, tensor: np.ndarray) -> np.ndarray:
+        result = tensor
+        for op in self.operations:
+            result = op.apply(result)
+        return result
+
+    def __repr__(self):
+        return f"CompositeOperation({self.operations})"
 
 
 class Recipe:
@@ -56,7 +91,17 @@ class Recipe:
         self.axis_sizes: Dict[str, int] = {}
 
     def add_operation(self, op: Operation) -> 'Recipe':
-        self.operations.append(op)
+        """Add an operation to the recipe, with potential optimizations."""
+        if not self.operations:
+            self.operations.append(op)
+        else:
+            # Try to optimize consecutive reshape operations
+            last_op = self.operations[-1]
+            if isinstance(last_op, Reshape) and isinstance(op, Reshape):
+                # Replace with a single reshape to the final shape
+                self.operations[-1] = Reshape(op.shape)
+            else:
+                self.operations.append(op)
         return self
 
     def execute(self, tensor: np.ndarray) -> np.ndarray:
@@ -65,9 +110,29 @@ class Recipe:
         for op in self.operations:
             result = op.apply(result)
         return result
-
-    def __repr__(self):
-        return f"Recipe(operations={self.operations}, input_shape={self.input_shape}, output_shape={self.output_shape})"
+        
+    def optimize(self):
+        """Optimize the sequence of operations."""
+        if not self.operations:
+            return
+            
+        # Merge consecutive operations of the same type where possible
+        optimized = []
+        for op in self.operations:
+            if len(optimized) > 0:
+                last_op = optimized[-1]
+                if isinstance(last_op, Reshape) and isinstance(op, Reshape):
+                    optimized[-1] = Reshape(op.shape)
+                elif isinstance(last_op, Transpose) and isinstance(op, Transpose):
+                    # Compose transpose operations
+                    new_axes = [last_op.axes[i] for i in op.axes]
+                    optimized[-1] = Transpose(new_axes)
+                else:
+                    optimized.append(op)
+            else:
+                optimized.append(op)
+                
+        self.operations = optimized
 
 
 class RecipeBuilder:
@@ -102,7 +167,10 @@ class RecipeBuilder:
             """Process a node in the expression tree and return the updated index."""
             if isinstance(node, AxisNode):
                 if shape_idx >= len(self.input_shape):
-                    raise ValidationError(f"Not enough dimensions in shape for axis '{node.name}'")
+                    raise ValidationError(
+                        f"Not enough dimensions in shape {self.input_shape} to bind axis '{node.name}' "
+                        f"(needed {shape_idx+1} but only have {len(self.input_shape)})"
+                    )
                 self.axis_sizes[node.name] = self.input_shape[shape_idx]
                 return shape_idx + 1
                 
@@ -222,115 +290,6 @@ class RecipeBuilder:
         
         return self.axis_sizes
 
-    def analyze_split_nodes(self):
-        """
-        Analyze split nodes in the input expression to correctly infer axis sizes.
-        
-        Steps:
-        1. Identify split nodes in the input expression
-        2. Treat the entire split node as a single dimension mapped to input size
-        3. Extract component axes and their sizes from kwargs
-        4. Validate that component sizes multiply to match the parent dimension
-        5. Update axis sizes dictionary with correct values
-        """
-        # Find all SplitNode instances in the input expression
-        split_nodes = []
-        
-        def find_split_nodes(nodes):
-            for node in nodes:
-                if isinstance(node, SplitNode):
-                    split_nodes.append(node)
-                elif isinstance(node, MergeNode):
-                    find_split_nodes(node.axes)
-        
-        find_split_nodes(self.input_expr.nodes)
-        
-        # Process each split node
-        for node in split_nodes:
-            # Step 1: Get the total size of this split node
-            # (should have been assigned during infer_axis_sizes_from_tree)
-            
-            # Find a reference axis to get the total size
-            reference_axis = None
-            for subnode in node.axes:
-                if isinstance(subnode, AxisNode):
-                    if subnode.name in self.axis_sizes and self.axis_sizes[subnode.name] is not None:
-                        reference_axis = subnode
-                        break
-            
-            if not reference_axis:
-                continue  # Can't process this split node without a reference
-            
-            parent_size = self.axis_sizes[reference_axis.name]
-            
-            # Step 2: Get all component axes (excluding the reference axis)
-            components = [subnode for subnode in node.axes if subnode != reference_axis]
-            named_components = [c for c in components if isinstance(c, AxisNode)]
-            anonymous_components = [c for c in components if isinstance(c, AnonymousAxis)]
-            
-            # Step 3: Calculate sizes for all components
-            component_sizes = {}
-            
-            # Add sizes from named components in kwargs
-            for comp in named_components:
-                if comp.name in self.axis_sizes and self.axis_sizes[comp.name] is not None:
-                    component_sizes[comp.name] = self.axis_sizes[comp.name]
-            
-            # Add sizes from anonymous components
-            for i, comp in enumerate(anonymous_components):
-                component_sizes[f"_anon_{i}"] = comp.value
-            
-            # Step 4: Validate or infer component sizes
-            
-            # If we know all component sizes, validate they multiply to match parent size
-            if len(component_sizes) > 0:
-                product = 1
-                for size in component_sizes.values():
-                    product *= size
-                
-                # If we have all components, verify they match the parent size
-                if len(component_sizes) == len(components):
-                    if product != parent_size:
-                        raise ValidationError(
-                            f"Split axis sizes don't multiply to match the parent size. "
-                            f"Got product {product}, expected {parent_size}"
-                        )
-                
-                # If we're missing exactly one component, calculate its size
-                elif len(component_sizes) == len(components) - 1:
-                    if parent_size % product != 0:
-                        raise ValidationError(
-                            f"Cannot evenly divide parent size {parent_size} by known factors {product}"
-                        )
-                    
-                    missing_size = parent_size // product
-                    
-                    # Find the component with missing size and assign it
-                    for comp in named_components:
-                        if comp.name not in component_sizes:
-                            self.axis_sizes[comp.name] = missing_size
-                            break
-                
-                # If we're missing more than one component, we need more information
-                else:
-                    missing_count = len(components) - len(component_sizes)
-                    if missing_count > 1:
-                        raise ValidationError(
-                            f"Need at least all but one component size to infer split dimensions. "
-                            f"Missing {missing_count} sizes for split of size {parent_size}"
-                        )
-            else:
-                # No component sizes available - can't proceed
-                raise ValidationError(
-                    f"No component sizes available for split node with total size {parent_size}. "
-                    f"Provide at least one component size via kwargs."
-                )
-            
-            # Step 5: Update all axis sizes for components
-            for comp in named_components:
-                if comp.name in component_sizes:
-                    self.axis_sizes[comp.name] = component_sizes[comp.name]
-
     def build_transpose_operation(self):
         """
         Build a transpose operation if the axis order changes.
@@ -339,13 +298,13 @@ class RecipeBuilder:
         # Get flat representations of input and output expressions
         flat_input = flatten_expr(self.input_expr.nodes)
         flat_output = flatten_expr(self.output_expr.nodes)
-        
+
         # Create mapping from axis names to positions in the input
         axis_positions = {}
         pos = 0
         ellipsis_pos = -1
         ellipsis_size = 0
-        
+
         # First pass: Map positions and handle ellipsis in input
         for node in flat_input:
             if isinstance(node, AxisNode):
@@ -356,12 +315,12 @@ class RecipeBuilder:
                 ellipsis_size = sum(1 for k in self.axis_sizes if k.startswith("..."))
                 ellipsis_pos = pos
                 pos += ellipsis_size
-        
+
         # Build the list of dimensions for ellipsis
         ellipsis_dims = []
         if ellipsis_pos >= 0:
             ellipsis_dims = list(range(ellipsis_pos, ellipsis_pos + ellipsis_size))
-        
+
         # Build the permutation indices based on output order
         perm = []
         for node in flat_output:
@@ -443,6 +402,10 @@ class RecipeBuilder:
         return self.recipe
 
 
+def get_cache_key(shape, pattern, axis_sizes):
+    """Generate a hashable cache key for recipe caching."""
+    return (shape, pattern, tuple(sorted(axis_sizes.items())))
+
 def rearrange(tensor: np.ndarray, pattern: str, **axis_sizes) -> np.ndarray:
     """
     Rearrange a tensor according to the pattern.
@@ -455,22 +418,28 @@ def rearrange(tensor: np.ndarray, pattern: str, **axis_sizes) -> np.ndarray:
     Returns:
         Transformed tensor
     """
-    if "->" not in pattern:
-        raise ValueError("Pattern must contain '->' to separate input and output expressions")
-        
-    input_pattern, output_pattern = pattern.split("->")
+    # Check for cache hit using shape + pattern + axis_sizes
+    cache_key = get_cache_key(tensor.shape, pattern, axis_sizes)
+    if cache_key in _RECIPE_CACHE:
+        return _RECIPE_CACHE[cache_key].execute(tensor)
     
-    # Parse expressions, passing along known axis sizes to help identify split nodes
-    input_expr = ParsedExpression(input_pattern.strip(), is_input_pattern=True, known_axes=axis_sizes)
-    output_expr = ParsedExpression(output_pattern.strip(), is_input_pattern=False)
+    # Parse pattern (this uses the pattern cache)
+    input_expr, output_expr = parse_pattern(pattern, axis_sizes)
     
-    # Build and execute the recipe
+    # Build recipe
     builder = RecipeBuilder(input_expr, output_expr, tensor.shape)
     
-    # Add any explicit axis sizes BEFORE inference
+    # Add axis sizes
     for axis, size in axis_sizes.items():
         builder.axis_sizes[axis] = size
     
+    # Build and optimize the recipe
     recipe = builder.build()
+    recipe.optimize()
     
+    # Cache the recipe (limit cache size to prevent memory issues)
+    if len(_RECIPE_CACHE) < 1000:
+        _RECIPE_CACHE[cache_key] = recipe
+    
+    # Execute and return result
     return recipe.execute(tensor)
